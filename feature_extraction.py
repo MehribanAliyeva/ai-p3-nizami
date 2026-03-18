@@ -113,57 +113,39 @@ def extract_pmi_features(texts, tokenized_docs, max_features=100, window_size=5)
     return X, vocab
 
 
-def extract_word2vec_features(texts, tokenized_docs, w2v_model, vector_size=100):
-    """
-    Extract Word2Vec features by averaging word vectors.
-    
-    Args:
-        texts: List of text documents
-        tokenized_docs: List of tokenized documents
-        w2v_model: Trained Word2Vec model
-        vector_size: Size of word vectors
-    
-    Returns:
-        Feature matrix (n_samples, vector_size)
-    """
-    X = np.zeros((len(tokenized_docs), vector_size))
-    
+
+def extract_word2vec_features(docs, tokenized_docs, model, vector_size=None):
+    if model is None:
+        return np.zeros((len(tokenized_docs), 0), dtype=np.float32)
+
+    actual_dim = model.wv.vector_size
+    X = np.zeros((len(tokenized_docs), actual_dim), dtype=np.float32)
+
     for i, doc in enumerate(tokenized_docs):
-        valid_words = [word for word in doc if word in w2v_model.wv]
-        if valid_words:
-            # Average of word vectors
-            vectors = [w2v_model.wv[word] for word in valid_words]
+        vectors = [model.wv[word] for word in doc if word in model.wv]
+        if vectors:
             X[i] = np.mean(vectors, axis=0)
-    
+
     return X
 
+import numpy as np
 
-def extract_glove_features(texts, tokenized_docs, glove_model, vector_size=100):
-    """
-    Extract GloVe features by averaging word vectors.
-    
-    Args:
-        texts: List of text documents
-        tokenized_docs: List of tokenized documents
-        glove_model: Trained GloVe model
-        vector_size: Size of word vectors
-    
-    Returns:
-        Feature matrix (n_samples, vector_size)
-    """
-    X = np.zeros((len(tokenized_docs), vector_size))
-    
+def extract_glove_features(docs, tokenized_docs, model, vector_size=None):
+    if model is None or model.word_vectors is None or model.word_vectors.size == 0:
+        return np.zeros((len(tokenized_docs), 0), dtype=np.float32)
+
+    actual_dim = model.word_vectors.shape[1]
+    X = np.zeros((len(tokenized_docs), actual_dim), dtype=np.float32)
+
     for i, doc in enumerate(tokenized_docs):
-        vectors = []
-        for word in doc:
-            word_id = glove_model.dictionary.get(word.lower())
-            if word_id is not None:
-                vectors.append(glove_model.word_vectors[word_id])
-        
+        vectors = [
+            model.word_vectors[model.dictionary[word]]
+            for word in doc
+            if word in model.dictionary
+        ]
         if vectors:
-            # Average of word vectors
             X[i] = np.mean(vectors, axis=0)
-    
+
     return X
 
 

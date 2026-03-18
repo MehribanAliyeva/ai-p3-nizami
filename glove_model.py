@@ -1,41 +1,27 @@
-"""
-GloVe-style model training and analysis utilities using Mittens.
-This version avoids the old glove-python package and replaces the
-dense co-occurrence matrix with a sparse SciPy matrix.
-
-Install:
-    pip install mittens scipy numpy
-"""
-
 from __future__ import annotations
 
+import os
 import pickle
-from collections import Counter, defaultdict
+import shutil
+import subprocess
+import tempfile
+from collections import Counter
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-from scipy.sparse import coo_matrix, csr_matrix
-from mittens import Mittens
 
 
 @dataclass
 class Corpus:
-    """
-    Replacement for glove.Corpus using a sparse co-occurrence matrix.
-    """
     dictionary: Dict[str, int]
     inverse_dictionary: Dict[int, str]
-    matrix: csr_matrix
     word_counts: Counter
+    tokenized_docs: List[List[str]]
 
 
 class GloveModel:
-    """
-    Lightweight wrapper around trained word vectors.
-    Keeps an interface similar to your previous code.
-    """
-
     def __init__(self, word_vectors: np.ndarray, dictionary: Dict[str, int]):
         self.word_vectors = np.asarray(word_vectors, dtype=np.float32)
         self.dictionary = dictionary
@@ -79,25 +65,11 @@ def _normalize_doc(doc: Sequence[object]) -> List[str]:
 
 def build_cooccurrence_corpus(
     tokenized_docs: Sequence[Sequence[object]],
-    window_size: int = 10,
     min_count: int = 1,
-    symmetric: bool = True,
 ) -> Corpus:
-    """
-    Build a sparse co-occurrence matrix.
-
-    Args:
-        tokenized_docs: list of tokenized documents
-        window_size: context window size
-        min_count: minimum token frequency to keep
-        symmetric: if True, add both (i, j) and (j, i)
-
-    Returns:
-        Corpus with sparse CSR matrix
-    """
     word_counts: Counter = Counter()
-
     normalized_docs: List[List[str]] = []
+
     for doc in tokenized_docs:
         tokens = _normalize_doc(doc)
         normalized_docs.append(tokens)
@@ -107,78 +79,193 @@ def build_cooccurrence_corpus(
     dictionary = {w: i for i, w in enumerate(vocab)}
     inverse_dictionary = {i: w for w, i in dictionary.items()}
 
-    cooc_dict = defaultdict(float)
-
-    for tokens in normalized_docs:
-        ids = [dictionary[w] for w in tokens if w in dictionary]
-
-        for center_pos, center_id in enumerate(ids):
-            start = max(0, center_pos - window_size)
-            end = min(len(ids), center_pos + window_size + 1)
-
-            for context_pos in range(start, end):
-                if context_pos == center_pos:
-                    continue
-
-                context_id = ids[context_pos]
-                distance = abs(center_pos - context_pos)
-                weight = 1.0 / distance
-
-                cooc_dict[(center_id, context_id)] += weight
-                if symmetric:
-                    cooc_dict[(context_id, center_id)] += weight
-
-    if not cooc_dict:
-        matrix = csr_matrix((len(vocab), len(vocab)), dtype=np.float32)
-    else:
-        rows, cols, data = zip(*[(i, j, v) for (i, j), v in cooc_dict.items()])
-        matrix = coo_matrix(
-            (np.array(data, dtype=np.float32), (rows, cols)),
-            shape=(len(vocab), len(vocab)),
-            dtype=np.float32,
-        ).tocsr()
+    filtered_docs = [
+        [w for w in doc if w in dictionary]
+        for doc in normalized_docs
+    ]
 
     return Corpus(
         dictionary=dictionary,
         inverse_dictionary=inverse_dictionary,
-        matrix=matrix,
         word_counts=word_counts,
+        tokenized_docs=filtered_docs,
     )
+
+
+def _find_glove_binary(glove_bin_dir: str, binary_name: str) -> str:
+    candidates = [
+        os.path.join(glove_bin_dir, binary_name),
+        os.path.join(glove_bin_dir, "build", binary_name),
+    ]
+    for path in candidates:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    raise FileNotFoundError(
+        f"Could not find executable '{binary_name}' in: {candidates}"
+    )
+
+
+def _write_corpus_text(corpus: Corpus, path: str) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        for doc in corpus.tokenized_docs:
+            if doc:
+                f.write(" ".join(doc) + "\n")
+
+
+def _run_command(cmd: List[str], cwd: Optional[str] = None) -> None:
+    result = subprocess.run(
+        cmd,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Command failed:\n{' '.join(cmd)}\n\nSTDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}"
+        )
+
+
+def _load_glove_vectors(vectors_txt_path: str) -> GloveModel:
+    dictionary: Dict[str, int] = {}
+    vectors: List[np.ndarray] = []
+
+    with open(vectors_txt_path, "r", encoding="utf-8") as f:
+        for idx, line in enumerate(f):
+            parts = line.rstrip("\n").split(" ")
+            if len(parts) < 2:
+                continue
+            word = parts[0]
+            vec = np.asarray(parts[1:], dtype=np.float32)
+            dictionary[word] = idx
+            vectors.append(vec)
+
+    if not vectors:
+        return GloveModel(
+            word_vectors=np.zeros((0, 0), dtype=np.float32),
+            dictionary={},
+        )
+
+    matrix = np.vstack(vectors).astype(np.float32, copy=False)
+    return GloveModel(word_vectors=matrix, dictionary=dictionary)
 
 
 def train_glove(
-    corpus,
-    vector_size=100,
-    learning_rate=0.05,
-    epochs=30,
-    no_components=None,
-    alpha=0.75,
-    x_max=100.0,
-    random_state=42,
-):
+    corpus: Corpus,
+    vector_size: int = 100,
+    learning_rate: float = 0.05,
+    epochs: int = 30,
+    x_max: float = 100.0,
+    window_size: int = 10,
+    min_count: int = 1,
+    symmetric: bool = True,
+    num_threads: int = 4,
+    memory_gb: float = 4.0,
+    verbose: int = 2,
+    glove_bin_dir: str = "GloVe",
+    cleanup_temp: bool = True,
+) -> GloveModel:
     """
-    Train GloVe model on the corpus.
+    Train exact GloVe using Stanford's original C implementation.
 
-    Parameters:
-    - vector_size: embedding size
-    - no_components: optional alias for vector_size, kept for compatibility
-    - learning_rate: learning rate
-    - epochs: number of iterations
-    - alpha: weighting exponent
-    - x_max: GloVe x_max parameter
+    Requirements:
+        git clone https://github.com/stanfordnlp/GloVe.git
+        cd GloVe && make
     """
-    actual_dim = no_components if no_components is not None else vector_size
+    vocab_size = len(corpus.dictionary)
+    if vocab_size == 0:
+        return GloveModel(
+            word_vectors=np.zeros((0, vector_size), dtype=np.float32),
+            dictionary={},
+        )
 
-    glove = Glove(
-        no_components=actual_dim,
-        learning_rate=learning_rate,
-        alpha=alpha,
-        x_max=x_max,
-        random_state=random_state,
-    )
-    glove.fit(corpus.matrix, epochs=epochs, no_threads=4, verbose=False)
-    glove.add_dictionary(corpus.dictionary)
-    return glove
+    vocab_count_bin = _find_glove_binary(glove_bin_dir, "vocab_count")
+    cooccur_bin = _find_glove_binary(glove_bin_dir, "cooccur")
+    shuffle_bin = _find_glove_binary(glove_bin_dir, "shuffle")
+    glove_bin = _find_glove_binary(glove_bin_dir, "glove")
+
+    tmpdir = tempfile.mkdtemp(prefix="glove_train_")
+    try:
+        corpus_txt = os.path.join(tmpdir, "corpus.txt")
+        vocab_file = os.path.join(tmpdir, "vocab.txt")
+        coocc_file = os.path.join(tmpdir, "cooccurrence.bin")
+        coocc_shuf_file = os.path.join(tmpdir, "cooccurrence.shuf.bin")
+        save_prefix = os.path.join(tmpdir, "vectors")
+
+        _write_corpus_text(corpus, corpus_txt)
+
+        # vocab_count < corpus.txt > vocab.txt
+        with open(corpus_txt, "r", encoding="utf-8") as fin, open(vocab_file, "w", encoding="utf-8") as fout:
+            result = subprocess.run(
+                [vocab_count_bin, "-min-count", str(min_count), "-verbose", str(verbose)],
+                stdin=fin,
+                stdout=fout,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"vocab_count failed:\n{result.stderr}")
+
+        # cooccur < corpus.txt > cooccurrence.bin
+        with open(corpus_txt, "r", encoding="utf-8") as fin, open(coocc_file, "wb") as fout:
+            cmd = [
+                cooccur_bin,
+                "-memory", str(memory_gb),
+                "-vocab-file", vocab_file,
+                "-verbose", str(verbose),
+                "-window-size", str(window_size),
+            ]
+            if symmetric:
+                cmd.extend(["-symmetric", "1"])
+            else:
+                cmd.extend(["-symmetric", "0"])
+
+            result = subprocess.run(
+                cmd,
+                stdin=fin,
+                stdout=fout,
+                stderr=subprocess.PIPE,
+
+                text=True,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"cooccur failed:\n{result.stderr}")
+
+        # shuffle < cooccurrence.bin > cooccurrence.shuf.bin
+        with open(coocc_file, "rb") as fin, open(coocc_shuf_file, "wb") as fout:
+            result = subprocess.run(
+                [shuffle_bin, "-memory", str(memory_gb), "-verbose", str(verbose)],
+                stdin=fin,
+                stdout=fout,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"shuffle failed:\n{result.stderr}")
+
+        # glove
+        cmd = [
+            glove_bin,
+            "-save-file", save_prefix,
+            "-threads", str(num_threads),
+            "-input-file", coocc_shuf_file,
+            "-x-max", str(x_max),
+            "-iter", str(epochs),
+            "-vector-size", str(vector_size),
+            "-binary", "0",
+            "-vocab-file", vocab_file,
+            "-verbose", str(verbose),
+            "-eta", str(learning_rate),
+        ]
+        _run_command(cmd)
+
+        vectors_txt = save_prefix + ".txt"
+        return _load_glove_vectors(vectors_txt)
+
+    finally:
+        if cleanup_temp:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
 
 def get_similar_words_glove(
     model: GloveModel,
@@ -208,6 +295,9 @@ def vector_arithmetic_glove(
 ) -> List[Tuple[str, float]]:
     positive = positive or []
     negative = negative or []
+
+    if model.word_vectors is None or model.word_vectors.size == 0:
+        return []
 
     result_vector = np.zeros(model.word_vectors.shape[1], dtype=np.float32)
 
@@ -267,15 +357,15 @@ def get_vocab_size(model: GloveModel) -> int:
 
 
 def get_vector_size(model: GloveModel) -> int:
-    return int(model.word_vectors.shape[1])
+    return int(model.word_vectors.shape[1]) if model.word_vectors.size else 0
 
 
 def save_corpus(corpus: Corpus, path: str) -> None:
     payload = {
         "dictionary": corpus.dictionary,
         "inverse_dictionary": corpus.inverse_dictionary,
-        "matrix": corpus.matrix,
         "word_counts": corpus.word_counts,
+        "tokenized_docs": corpus.tokenized_docs,
     }
     with open(path, "wb") as f:
         pickle.dump(payload, f)
@@ -288,6 +378,6 @@ def load_corpus(path: str) -> Corpus:
     return Corpus(
         dictionary=payload["dictionary"],
         inverse_dictionary=payload["inverse_dictionary"],
-        matrix=payload["matrix"],
         word_counts=payload["word_counts"],
+        tokenized_docs=payload["tokenized_docs"],
     )

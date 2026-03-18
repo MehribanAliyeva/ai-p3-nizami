@@ -1,33 +1,19 @@
-import numpy as np
-import streamlit as st
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
 import os
 import pickle
 from pathlib import Path
 
-MODEL_DIR = Path("saved_models")
-MODEL_DIR.mkdir(exist_ok=True)
-
-WORD2VEC_PATH = MODEL_DIR / "word2vec.model"
-GLOVE_PATH = MODEL_DIR / "glove.pkl"
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import streamlit as st
 from gensim.models import Word2Vec
 
-def save_word2vec_model(model, path=WORD2VEC_PATH):
-    model.save(str(path))
-
-
-def load_word2vec_model(path=WORD2VEC_PATH):
-    if path.exists():
-        return Word2Vec.load(str(path))
-    return None
 from corpus_utils import (
+    corpus_summary,
+    docs_to_tokens,
     read_corpus,
     split_into_documents,
-    docs_to_tokens,
-    corpus_summary,
-    flatten,
 )
 from analysis import (
     build_term_document_matrix,
@@ -35,26 +21,26 @@ from analysis import (
     get_top_word_frequencies,
 )
 from word2vec_model import (
-    train_word2vec,
-    get_similar_words,
-    vector_arithmetic,
     cosine_similarity_between_words,
+    get_similar_words,
+    train_word2vec,
+    vector_arithmetic,
 )
 from glove_model import (
     build_cooccurrence_corpus,
-    train_glove,
-    get_similar_words_glove,
-    vector_arithmetic_glove,
     cosine_similarity_glove,
-    get_vocab_size,
+    get_similar_words_glove,
     get_vector_size,
+    get_vocab_size,
+    train_glove,
+    vector_arithmetic_glove,
 )
 from feature_extraction import (
     extract_count_vectorizer_features,
-    extract_tfidf_features,
-    extract_pmi_features,
-    extract_word2vec_features,
     extract_glove_features,
+    extract_pmi_features,
+    extract_tfidf_features,
+    extract_word2vec_features,
     prepare_features_for_rnn,
 )
 from rnn_classifier import (
@@ -62,10 +48,61 @@ from rnn_classifier import (
     run_full_comparison,
 )
 
+# ---------------------------------------------------
+# Paths
+# ---------------------------------------------------
+MODEL_DIR = Path("saved_models")
+MODEL_DIR.mkdir(exist_ok=True)
+
+WORD2VEC_PATH = MODEL_DIR / "word2vec.model"
+WORD2VEC_META_PATH = MODEL_DIR / "word2vec_meta.pkl"
+
+GLOVE_PATH = MODEL_DIR / "glove.pkl"
+GLOVE_META_PATH = MODEL_DIR / "glove_meta.pkl"
+
+# ---------------------------------------------------
+# Streamlit config
+# ---------------------------------------------------
 st.set_page_config(page_title="Poetry NLP Analyzer", layout="wide")
-def save_glove_model(model, path=GLOVE_PATH):
+
+
+# ---------------------------------------------------
+# Persistence helpers
+# ---------------------------------------------------
+def save_pickle(obj, path: Path):
+    with open(path, "wb") as f:
+        pickle.dump(obj, f)
+
+
+def load_pickle(path: Path):
+    if path.exists():
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    return None
+
+
+def save_word2vec_model(model, params=None, path=WORD2VEC_PATH, meta_path=WORD2VEC_META_PATH):
+    model.save(str(path))
+    if params is not None:
+        save_pickle(params, meta_path)
+
+
+def load_word2vec_model(path=WORD2VEC_PATH):
+    if path.exists():
+        return Word2Vec.load(str(path))
+    return None
+
+
+def load_word2vec_params(meta_path=WORD2VEC_META_PATH):
+    params = load_pickle(meta_path)
+    return params if isinstance(params, dict) else {}
+
+
+def save_glove_model(model, params=None, path=GLOVE_PATH, meta_path=GLOVE_META_PATH):
     with open(path, "wb") as f:
         pickle.dump(model, f)
+    if params is not None:
+        save_pickle(params, meta_path)
 
 
 def load_glove_model(path=GLOVE_PATH):
@@ -74,6 +111,45 @@ def load_glove_model(path=GLOVE_PATH):
             return pickle.load(f)
     return None
 
+
+def load_glove_params(meta_path=GLOVE_META_PATH):
+    params = load_pickle(meta_path)
+    return params if isinstance(params, dict) else {}
+
+
+def initialize_saved_models():
+    if "w2v_model" not in st.session_state:
+        loaded_w2v = load_word2vec_model()
+        if loaded_w2v is not None:
+            st.session_state["w2v_model"] = loaded_w2v
+            st.session_state["w2v_params"] = load_word2vec_params()
+
+    if "glove_model" not in st.session_state:
+        loaded_glove = load_glove_model()
+        if loaded_glove is not None:
+            st.session_state["glove_model"] = loaded_glove
+            st.session_state["glove_params"] = load_glove_params()
+
+
+def get_trained_word2vec():
+    return st.session_state.get("w2v_model")
+
+
+def get_trained_glove():
+    return st.session_state.get("glove_model")
+
+
+def get_word2vec_params():
+    return st.session_state.get("w2v_params", {})
+
+
+def get_glove_params():
+    return st.session_state.get("glove_params", {})
+
+
+# ---------------------------------------------------
+# Data loading
+# ---------------------------------------------------
 @st.cache_data
 def load_and_process_corpus(path):
     raw_text = read_corpus(path)
@@ -83,10 +159,6 @@ def load_and_process_corpus(path):
 
 
 def safe_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Make dataframe safe for Streamlit Arrow serialization.
-    Converts object/mixed columns to string.
-    """
     df = df.copy()
     for col in df.columns:
         if df[col].dtype == "object":
@@ -100,6 +172,7 @@ def plot_bar(df, x_col, y_col, title):
     ax.set_title(title)
     ax.tick_params(axis="x", rotation=45)
     st.pyplot(fig)
+    plt.close(fig)
 
 
 def plot_heatmap(df, title, max_rows=25, max_cols=25):
@@ -108,8 +181,12 @@ def plot_heatmap(df, title, max_rows=25, max_cols=25):
     sns.heatmap(sub_df, cmap="YlGnBu", ax=ax)
     ax.set_title(title)
     st.pyplot(fig)
+    plt.close(fig)
 
 
+# ---------------------------------------------------
+# Training
+# ---------------------------------------------------
 def train_word2vec_once(tokenized_docs, vector_size, window, min_count, sg, epochs):
     with st.spinner("Training Word2Vec..."):
         model = train_word2vec(
@@ -122,67 +199,54 @@ def train_word2vec_once(tokenized_docs, vector_size, window, min_count, sg, epoc
             workers=4,
         )
 
-    save_word2vec_model(model)
-
-    st.session_state["w2v_model"] = model
-    st.session_state["w2v_params"] = {
+    params = {
         "vector_size": vector_size,
         "window": window,
         "min_count": min_count,
         "sg": sg,
         "epochs": epochs,
+        "architecture": "Skip-gram" if sg == 1 else "CBOW",
     }
 
+    save_word2vec_model(model, params=params)
+    st.session_state["w2v_model"] = model
+    st.session_state["w2v_params"] = params
 
-def train_glove_once(tokenized_docs, vector_size, window_size, learning_rate, epochs):
+
+def train_glove_once(tokenized_docs, vector_size, window_size, epochs, learning_rate):
     with st.spinner("Building co-occurrence corpus and training GloVe..."):
-        corpus = build_cooccurrence_corpus(tokenized_docs, window_size=window_size)
+        corpus = build_cooccurrence_corpus(tokenized_docs)
         model = train_glove(
-            corpus=corpus,
-            no_components=vector_size,
-            learning_rate=learning_rate,
+            corpus,
+            vector_size=vector_size,
+            window_size=window_size,
             epochs=epochs,
+            learning_rate=learning_rate,
         )
 
-    save_glove_model(model)
-
-    st.session_state["glove_model"] = model
-    st.session_state["glove_params"] = {
+    params = {
         "vector_size": vector_size,
         "window_size": window_size,
-        "learning_rate": learning_rate,
         "epochs": epochs,
+        "learning_rate": learning_rate,
+        "alpha": 0.75,
     }
 
-def get_trained_word2vec():
-    if "w2v_model" not in st.session_state:
-        loaded = load_word2vec_model()
-        if loaded is not None:
-            st.session_state["w2v_model"] = loaded
-    return st.session_state.get("w2v_model")
+    save_glove_model(model, params=params)
+    st.session_state["glove_model"] = model
+    st.session_state["glove_params"] = params
 
 
-def get_trained_glove():
-    if "glove_model" not in st.session_state:
-        loaded = load_glove_model()
-        if loaded is not None:
-            st.session_state["glove_model"] = loaded
-    return st.session_state.get("glove_model")
-
-
-def get_trained_word2vec():
-    return st.session_state.get("w2v_model")
-
-
-def get_trained_glove():
-    return st.session_state.get("glove_model")
-
+# ---------------------------------------------------
+# App init
+# ---------------------------------------------------
+initialize_saved_models()
 
 st.title("Poetry Corpus NLP Dashboard")
 
-# -----------------------------
+# ---------------------------------------------------
 # Sidebar
-# -----------------------------
+# ---------------------------------------------------
 st.sidebar.header("Settings")
 corpus_path = st.sidebar.text_input("Corpus file path", "_ALL_CLEAN_CORPUS.txt")
 
@@ -197,42 +261,54 @@ st.sidebar.header("Word2Vec Parameters")
 vector_size = st.sidebar.slider("Vector size", 50, 300, 100, step=50)
 window = st.sidebar.slider("Word2Vec window", 2, 10, 5)
 min_count = st.sidebar.slider("Min count", 1, 10, 2)
-epochs = st.sidebar.slider("Epochs", 5, 100, 20)
+epochs = st.sidebar.slider("Epochs", 5, 500, 20)
 architecture = st.sidebar.selectbox("Architecture", ["Skip-gram", "CBOW"])
 sg = 1 if architecture == "Skip-gram" else 0
 
 st.sidebar.header("GloVe Parameters")
 glove_vector_size = st.sidebar.slider("GloVe vector size", 50, 300, 100, step=50)
 glove_window = st.sidebar.slider("GloVe window", 2, 15, 5)
-glove_learning_rate = st.sidebar.slider("GloVe learning rate", 0.01, 0.1, 0.05, step=0.01)
-glove_epochs = st.sidebar.slider("GloVe epochs", 5, 30, 10)
+glove_epochs = st.sidebar.slider("GloVe epochs", 5, 500, 10)
+learning_rate = st.sidebar.slider("Learning rate", 0.01, 0.1, 0.05)
 
-# -----------------------------
-# Load corpus first
-# -----------------------------
+st.sidebar.header("Train Models")
+
+if WORD2VEC_PATH.exists():
+    st.sidebar.caption("Saved Word2Vec model found.")
+if GLOVE_PATH.exists():
+    st.sidebar.caption("Saved GloVe model found.")
+
+if st.sidebar.button("Train / Refresh Word2Vec"):
+    try:
+        raw_text, docs, tokenized_docs = load_and_process_corpus(corpus_path)
+        train_word2vec_once(tokenized_docs, vector_size, window, min_count, sg, epochs)
+        st.sidebar.success("Word2Vec trained and saved.")
+    except FileNotFoundError:
+        st.sidebar.error(f"File not found: {corpus_path}")
+        st.stop()
+
+if st.sidebar.button("Train / Refresh GloVe"):
+    try:
+        raw_text, docs, tokenized_docs = load_and_process_corpus(corpus_path)
+        train_glove_once(tokenized_docs, glove_vector_size, glove_window, glove_epochs, learning_rate)
+        st.sidebar.success("GloVe trained and saved.")
+    except FileNotFoundError:
+        st.sidebar.error(f"File not found: {corpus_path}")
+        st.stop()
+
+# ---------------------------------------------------
+# Load corpus
+# ---------------------------------------------------
 try:
     raw_text, docs, tokenized_docs = load_and_process_corpus(corpus_path)
 except FileNotFoundError:
     st.error(f"File not found: {corpus_path}")
     st.stop()
 
-# -----------------------------
-# Training buttons
-# -----------------------------
-st.sidebar.header("Train Models")
-
-if st.sidebar.button("Train / Refresh Word2Vec"):
-    train_word2vec_once(tokenized_docs, vector_size, window, min_count, sg, epochs)
-    st.sidebar.success("Word2Vec trained.")
-
-if st.sidebar.button("Train / Refresh GloVe"):
-    train_glove_once(tokenized_docs, glove_vector_size, glove_window, glove_learning_rate, glove_epochs)
-    st.sidebar.success("GloVe trained.")
-
 summary = corpus_summary(
     tokenized_docs,
     frequent_threshold=freq_threshold,
-    rare_threshold=rare_threshold
+    rare_threshold=rare_threshold,
 )
 
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
@@ -242,12 +318,12 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "Task 3: GloVe",
     "Task 4: Comparison",
     "Task 5: RNN Classification",
-    "Interactive Model"
+    "Interactive Model",
 ])
 
-# -----------------------------
+# ---------------------------------------------------
 # Tab 1
-# -----------------------------
+# ---------------------------------------------------
 with tab1:
     st.header("Dataset Description")
 
@@ -267,14 +343,14 @@ with tab1:
 
     st.subheader("Sample Documents")
     preview_df = pd.DataFrame({
-        "document_id": [f"doc_{i+1}" for i in range(min(5, len(docs)))],
-        "text": docs[:5]
+        "document_id": [f"doc_{i + 1}" for i in range(min(5, len(docs)))],
+        "text": docs[:5],
     })
     st.dataframe(safe_dataframe(preview_df), width="stretch")
 
-# -----------------------------
+# ---------------------------------------------------
 # Tab 2
-# -----------------------------
+# ---------------------------------------------------
 with tab2:
     st.header("Matrix Visualizations")
 
@@ -285,32 +361,42 @@ with tab2:
         tdm_df,
         "Term-Document Matrix Heatmap",
         max_rows=min(25, len(tdm_df)),
-        max_cols=min(25, len(tdm_df.columns))
+        max_cols=min(25, len(tdm_df.columns)),
     )
 
     st.subheader("Word-Word Co-occurrence Matrix")
     wwm_df = build_word_word_matrix(
         tokenized_docs,
         vocab_size=wwm_vocab_size,
-        window_size=wwm_window
+        window_size=wwm_window,
     )
     st.dataframe(safe_dataframe(wwm_df.iloc[:20, :20]), width="stretch")
     plot_heatmap(wwm_df, "Word-Word Co-occurrence Matrix Heatmap", max_rows=25, max_cols=25)
 
-# -----------------------------
+# ---------------------------------------------------
 # Tab 3
-# -----------------------------
+# ---------------------------------------------------
 with tab3:
     st.header("Word2Vec Results")
 
     model = get_trained_word2vec()
+    saved_params = get_word2vec_params()
+
     if model is None:
         st.info("Train Word2Vec from the sidebar first.")
     else:
+        st.success("Using saved Word2Vec model." if WORD2VEC_PATH.exists() else "Using current session Word2Vec model.")
+
         st.markdown("### Chosen Parameters")
         param_df = pd.DataFrame({
             "Parameter": ["vector_size", "window", "min_count", "architecture", "epochs"],
-            "Value": [str(vector_size), str(window), str(min_count), architecture, str(epochs)]
+            "Value": [
+                str(saved_params.get("vector_size", vector_size)),
+                str(saved_params.get("window", window)),
+                str(saved_params.get("min_count", min_count)),
+                saved_params.get("architecture", architecture),
+                str(saved_params.get("epochs", epochs)),
+            ],
         })
         st.dataframe(safe_dataframe(param_df), width="stretch")
 
@@ -324,10 +410,10 @@ with tab3:
 """)
 
         st.subheader("Similar Words for 10 Query Words")
-        default_words = ["sevgi", "gözəl", "şah", "qəlb", "dünya", "gecə", "işıq", "qara", "yol", "gül"]
+        default_words = ["günəş", "rəng", "qız", "qəlb", "dünya", "gecə", "aşiq", "qara", "yol", "gül"]
         query_words = st.text_area(
             "Enter 10 words separated by commas",
-            value=", ".join(default_words)
+            value=", ".join(default_words),
         )
         query_words = [w.strip().lower() for w in query_words.split(",") if w.strip()]
 
@@ -339,13 +425,13 @@ with tab3:
                     results.append({
                         "query_word": word,
                         "similar_word": sim_word,
-                        "similarity": round(score, 4)
+                        "similarity": round(score, 4),
                     })
             else:
                 results.append({
                     "query_word": word,
                     "similar_word": "OOV / not in vocabulary",
-                    "similarity": ""
+                    "similarity": "",
                 })
 
         sim_df = pd.DataFrame(results)
@@ -354,23 +440,27 @@ with tab3:
         st.subheader("Vector Arithmetic")
         col1, col2 = st.columns(2)
         with col1:
-            positive_words = st.text_input("Positive words (+)", "sevgi")
+            positive_words = st.text_input("Positive words (+)", "şahzadə")
         with col2:
-            negative_words = st.text_input("Negative words (-)", "pis")
+            negative_words = st.text_input("Negative words (-)", "qız")
 
         pos = [w.strip().lower() for w in positive_words.split(",") if w.strip()]
         neg = [w.strip().lower() for w in negative_words.split(",") if w.strip()]
 
         arithmetic_results = vector_arithmetic(model, positive=pos, negative=neg, topn=10)
-        arithmetic_df = pd.DataFrame(arithmetic_results, columns=["word", "score"]) if arithmetic_results else pd.DataFrame(columns=["word", "score"])
+        arithmetic_df = (
+            pd.DataFrame(arithmetic_results, columns=["word", "score"])
+            if arithmetic_results else
+            pd.DataFrame(columns=["word", "score"])
+        )
         st.dataframe(safe_dataframe(arithmetic_df), width="stretch")
 
         st.subheader("Pairwise Similarity")
         c1, c2 = st.columns(2)
         with c1:
-            w1 = st.text_input("Word 1", "sevgi")
+            w1 = st.text_input("Word 1", "ay")
         with c2:
-            w2 = st.text_input("Word 2", "məhəbbət")
+            w2 = st.text_input("Word 2", "gecə")
 
         sim_score = cosine_similarity_between_words(model, w1.lower(), w2.lower())
         if sim_score is not None:
@@ -378,36 +468,40 @@ with tab3:
         else:
             st.warning("One or both words are not in the model vocabulary.")
 
-# -----------------------------
+# ---------------------------------------------------
 # Tab 4
-# -----------------------------
+# ---------------------------------------------------
 with tab4:
     st.header("GloVe Results")
 
     glove_model = get_trained_glove()
+    saved_glove_params = get_glove_params()
+
     if glove_model is None:
         st.info("Train GloVe from the sidebar first.")
     else:
+        st.success("Using saved GloVe model." if GLOVE_PATH.exists() else "Using current session GloVe model.")
+
         st.markdown("### Chosen Parameters")
         glove_param_df = pd.DataFrame({
             "Parameter": ["vector_size", "window_size", "learning_rate", "epochs", "alpha"],
             "Value": [
-                str(glove_vector_size),
-                str(glove_window),
-                str(glove_learning_rate),
-                str(glove_epochs),
-                "0.75 (default)"
-            ]
+                str(saved_glove_params.get("vector_size", glove_vector_size)),
+                str(saved_glove_params.get("window_size", glove_window)),
+                str(saved_glove_params.get("learning_rate", learning_rate)),
+                str(saved_glove_params.get("epochs", glove_epochs)),
+                str(saved_glove_params.get("alpha", 0.75)),
+            ],
         })
         st.dataframe(safe_dataframe(glove_param_df), width="stretch")
 
         st.markdown("""
-**GloVe Parameter Meanings:**
-- **vector_size (no_components)**: Dimensionality of word embeddings
-- **window_size**: Co-occurrence window size
-- **learning_rate**: Step size for optimization
-- **epochs**: Number of training iterations
-- **alpha**: Weighting function exponent
+**GloVe Parameter Meanings**
+- **vector_size (no_components)**: dimensionality of word embeddings
+- **window_size**: co-occurrence window size
+- **learning_rate**: step size for optimization
+- **epochs**: number of training iterations
+- **alpha**: weighting function exponent
 """)
 
         st.markdown(
@@ -416,11 +510,11 @@ with tab4:
         )
 
         st.subheader("Similar Words for 10 Query Words")
-        default_words_glove = ["sevgi", "gözəl", "şah", "qəlb", "dünya", "gecə", "işıq", "qara", "yol", "gül"]
+        default_words_glove = ["sevgi", "bahar", "şah", "qəlb", "dünya", "gecə", "işıq", "qara", "yol", "gül"]
         query_words_glove = st.text_area(
             "Enter 10 words separated by commas (GloVe)",
             value=", ".join(default_words_glove),
-            key="glove_query"
+            key="glove_query",
         )
         query_words_glove = [w.strip().lower() for w in query_words_glove.split(",") if w.strip()]
 
@@ -432,13 +526,13 @@ with tab4:
                     glove_results.append({
                         "query_word": word,
                         "similar_word": sim_word,
-                        "similarity": round(score, 4)
+                        "similarity": round(score, 4),
                     })
             else:
                 glove_results.append({
                     "query_word": word,
                     "similar_word": "OOV / not in vocabulary",
-                    "similarity": ""
+                    "similarity": "",
                 })
 
         glove_sim_df = pd.DataFrame(glove_results)
@@ -447,23 +541,27 @@ with tab4:
         st.subheader("Vector Arithmetic")
         col1, col2 = st.columns(2)
         with col1:
-            positive_words_glove = st.text_input("Positive words (+) [GloVe]", "sevgi", key="glove_pos")
+            positive_words_glove = st.text_input("Positive words (+) [GloVe]", "şahzadə", key="glove_pos")
         with col2:
-            negative_words_glove = st.text_input("Negative words (-) [GloVe]", "pis", key="glove_neg")
+            negative_words_glove = st.text_input("Negative words (-) [GloVe]", "qız", key="glove_neg")
 
         pos_glove = [w.strip().lower() for w in positive_words_glove.split(",") if w.strip()]
         neg_glove = [w.strip().lower() for w in negative_words_glove.split(",") if w.strip()]
 
         arithmetic_results_glove = vector_arithmetic_glove(glove_model, positive=pos_glove, negative=neg_glove, topn=10)
-        arithmetic_df_glove = pd.DataFrame(arithmetic_results_glove, columns=["word", "score"]) if arithmetic_results_glove else pd.DataFrame(columns=["word", "score"])
+        arithmetic_df_glove = (
+            pd.DataFrame(arithmetic_results_glove, columns=["word", "score"])
+            if arithmetic_results_glove else
+            pd.DataFrame(columns=["word", "score"])
+        )
         st.dataframe(safe_dataframe(arithmetic_df_glove), width="stretch")
 
         st.subheader("Pairwise Similarity")
         c1, c2 = st.columns(2)
         with c1:
-            w1_glove = st.text_input("Word 1 [GloVe]", "sevgi", key="glove_w1")
+            w1_glove = st.text_input("Word 1 [GloVe]", "ay", key="glove_w1")
         with c2:
-            w2_glove = st.text_input("Word 2 [GloVe]", "məhəbbət", key="glove_w2")
+            w2_glove = st.text_input("Word 2 [GloVe]", "gecə", key="glove_w2")
 
         sim_score_glove = cosine_similarity_glove(glove_model, w1_glove.lower(), w2_glove.lower())
         if sim_score_glove is not None:
@@ -471,9 +569,9 @@ with tab4:
         else:
             st.warning("One or both words are not in the model vocabulary.")
 
-# -----------------------------
+# ---------------------------------------------------
 # Tab 5
-# -----------------------------
+# ---------------------------------------------------
 with tab5:
     st.header("Task 4: Word2Vec vs GloVe Comparison")
 
@@ -483,54 +581,56 @@ with tab5:
     if w2v_model is None or glove_model is None:
         st.info("Train both Word2Vec and GloVe from the sidebar first.")
     else:
+        w2v_params = get_word2vec_params()
+        glove_params = get_glove_params()
+
         st.markdown("""
 This task compares the results from **Task 2 (Word2Vec)** and **Task 3 (GloVe)** to identify:
-- Which model performs better for synonym detection
-- Differences in semantic similarity patterns
-- Strengths and weaknesses of each approach
+- which model performs better for synonym detection
+- differences in semantic similarity patterns
+- strengths and weaknesses of each approach
 """)
 
         st.subheader("1. Model Specifications Comparison")
         spec_comparison = pd.DataFrame({
             "Specification": ["Architecture", "Vector Size", "Window Size", "Training Method", "Vocabulary Size"],
             "Word2Vec": [
-                "Skip-gram" if sg == 1 else "CBOW",
-                str(vector_size),
-                str(window),
+                w2v_params.get("architecture", "Skip-gram" if sg == 1 else "CBOW"),
+                str(w2v_params.get("vector_size", vector_size)),
+                str(w2v_params.get("window", window)),
                 "Predictive (Neural Network)",
-                f"{len(w2v_model.wv):,}"
+                f"{len(w2v_model.wv):,}",
             ],
             "GloVe": [
                 "Count-based",
-                str(glove_vector_size),
-                str(glove_window),
+                str(glove_params.get("vector_size", glove_vector_size)),
+                str(glove_params.get("window_size", glove_window)),
                 "Co-occurrence Matrix Factorization",
-                f"{get_vocab_size(glove_model):,}"
-            ]
+                f"{get_vocab_size(glove_model):,}",
+            ],
         })
         st.dataframe(safe_dataframe(spec_comparison), width="stretch")
 
         st.subheader("2. Synonym Detection Comparison")
         comparison_words = st.text_input(
             "Enter words to compare (comma-separated)",
-            value="sevgi, gözəl, şah, qəlb, dünya, gecə, işıq, qara, yol, gül",
-            key="comparison_words"
+            value="günəş, rəng, qız, qəlb, dünya, gecə, aşiq, qara, yol, gül",
+            key="comparison_words",
         )
         comparison_words = [w.strip().lower() for w in comparison_words.split(",") if w.strip()]
 
         comparison_results = []
         for word in comparison_words[:10]:
-            w2v_similar = []
             if word in w2v_model.wv:
                 w2v_top = w2v_model.wv.most_similar(word, topn=3)
                 w2v_similar = [f"{w} ({s:.3f})" for w, s in w2v_top]
             else:
                 w2v_similar = ["OOV"]
 
-            glove_similar = []
             word_id = glove_model.dictionary.get(word)
             if word_id is not None:
                 glove_top = glove_model.most_similar(word_id, number=3)
+                glove_similar = []
                 for sim_id, score in glove_top:
                     sim_word = glove_model.inverse_dictionary.get(sim_id)
                     if sim_word is not None:
@@ -541,7 +641,7 @@ This task compares the results from **Task 2 (Word2Vec)** and **Task 3 (GloVe)**
             comparison_results.append({
                 "Query Word": word,
                 "Word2Vec Top 3": ", ".join(w2v_similar),
-                "GloVe Top 3": ", ".join(glove_similar)
+                "GloVe Top 3": ", ".join(glove_similar),
             })
 
         comparison_df = pd.DataFrame(comparison_results)
@@ -550,35 +650,27 @@ This task compares the results from **Task 2 (Word2Vec)** and **Task 3 (GloVe)**
         st.subheader("3. Pairwise Similarity Comparison")
         col1, col2 = st.columns(2)
         with col1:
-            pair_w1 = st.text_input("Word 1", "sevgi", key="comp_w1")
+            pair_w1 = st.text_input("Word 1", "ay", key="comp_w1")
         with col2:
-            pair_w2 = st.text_input("Word 2", "məhəbbət", key="comp_w2")
+            pair_w2 = st.text_input("Word 2", "gecə", key="comp_w2")
 
         w2v_sim = None
-        glove_sim = None
-
         if pair_w1 in w2v_model.wv and pair_w2 in w2v_model.wv:
             w2v_sim = w2v_model.wv.similarity(pair_w1, pair_w2)
 
         glove_sim = cosine_similarity_glove(glove_model, pair_w1, pair_w2)
 
         col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Word2Vec Similarity", f"{w2v_sim:.4f}" if w2v_sim is not None else "OOV")
-        with col2:
-            st.metric("GloVe Similarity", f"{glove_sim:.4f}" if glove_sim is not None else "OOV")
-        with col3:
-            if w2v_sim is not None and glove_sim is not None:
-                st.metric("Difference", f"{abs(w2v_sim - glove_sim):.4f}")
-            else:
-                st.metric("Difference", "N/A")
+        col1.metric("Word2Vec Similarity", f"{w2v_sim:.4f}" if w2v_sim is not None else "OOV")
+        col2.metric("GloVe Similarity", f"{glove_sim:.4f}" if glove_sim is not None else "OOV")
+        col3.metric("Difference", f"{abs(w2v_sim - glove_sim):.4f}" if w2v_sim is not None and glove_sim is not None else "N/A")
 
         st.subheader("4. Vector Arithmetic Comparison")
         col1, col2 = st.columns(2)
         with col1:
-            arith_positive = st.text_input("Positive words (+)", "sevgi", key="comp_pos")
+            arith_positive = st.text_input("Positive words (+)", "şahzadə", key="comp_pos")
         with col2:
-            arith_negative = st.text_input("Negative words (-)", "pis", key="comp_neg")
+            arith_negative = st.text_input("Negative words (-)", "qız", key="comp_neg")
 
         pos_words = [w.strip().lower() for w in arith_positive.split(",") if w.strip()]
         neg_words = [w.strip().lower() for w in arith_negative.split(",") if w.strip()]
@@ -592,8 +684,7 @@ This task compares the results from **Task 2 (Word2Vec)** and **Task 3 (GloVe)**
         glove_arith = vector_arithmetic_glove(glove_model, positive=pos_words, negative=neg_words, topn=5)
         glove_arith_df = (
             pd.DataFrame(glove_arith, columns=["word", "score"])
-            if glove_arith else
-            pd.DataFrame({"word": ["Error"], "score": [0]})
+            if glove_arith else pd.DataFrame({"word": ["Error"], "score": [0]})
         )
 
         col1, col2 = st.columns(2)
@@ -606,22 +697,10 @@ This task compares the results from **Task 2 (Word2Vec)** and **Task 3 (GloVe)**
 
         st.subheader("5. Analysis & Conclusions")
         st.markdown("""
-### Key Findings
-
+###
 **Methodology Differences**
 - **Word2Vec:** predictive approach using local context
 - **GloVe:** count-based approach using global co-occurrence statistics
-
-**Performance Observations**
-1. Compare synonym quality above
-2. Compare similarity scores above
-3. Compare vector arithmetic behavior
-4. Compare vocabulary coverage
-
-**Recommendations**
-- For small poetry corpora, results can vary based on preprocessing and vocabulary size
-- Word2Vec often handles local context well
-- GloVe can capture broader global relations
 """)
 
         csv_data = comparison_df.to_csv(index=False)
@@ -629,12 +708,12 @@ This task compares the results from **Task 2 (Word2Vec)** and **Task 3 (GloVe)**
             label="Download Comparison Table (CSV)",
             data=csv_data,
             file_name="word2vec_vs_glove_comparison.csv",
-            mime="text/csv"
+            mime="text/csv",
         )
 
-# -----------------------------
+# ---------------------------------------------------
 # Tab 6
-# -----------------------------
+# ---------------------------------------------------
 with tab6:
     st.header("Task 5: RNN Text Classification")
 
@@ -676,18 +755,25 @@ using **5 different feature extraction methods**: Count Vectorizer, TF-IDF, PMI,
                 X_pmi, _ = extract_pmi_features(docs, tokenized_docs, max_features=max_features)
                 X_pmi = prepare_features_for_rnn(X_pmi, max_len=50)
 
-                X_w2v = extract_word2vec_features(docs, tokenized_docs, w2v_model, vector_size=vector_size)
+                X_w2v = extract_word2vec_features(
+                    docs,
+                    tokenized_docs,
+                    w2v_model,
+                )
                 X_w2v = prepare_features_for_rnn(X_w2v, max_len=50)
 
-                X_glove = extract_glove_features(docs, tokenized_docs, glove_model, vector_size=glove_vector_size)
+                X_glove = extract_glove_features(
+                    docs,
+                    tokenized_docs,
+                    glove_model,
+                )
                 X_glove = prepare_features_for_rnn(X_glove, max_len=50)
-
                 X_dict = {
                     "Count Vectorizer": X_count,
                     "TF-IDF": X_tfidf,
                     "PMI": X_pmi,
                     "Word2Vec": X_w2v,
-                    "GloVe": X_glove
+                    "GloVe": X_glove,
                 }
 
                 results = run_full_comparison(
@@ -696,7 +782,7 @@ using **5 different feature extraction methods**: Count Vectorizer, TF-IDF, PMI,
                     model_types=["RNN", "BiRNN", "LSTM"],
                     epochs=rnn_epochs,
                     units=rnn_units,
-                    verbose=0
+                    verbose=0,
                 )
 
                 results_df = pd.DataFrame(results)
@@ -733,36 +819,17 @@ using **5 different feature extraction methods**: Count Vectorizer, TF-IDF, PMI,
 
                 plt.tight_layout()
                 st.pyplot(fig)
+                plt.close(fig)
 
                 csv_data = results_df[["Feature", "Model", "Accuracy", "F1-Score"]].to_csv(index=False)
                 st.download_button(
                     label="Download Results Table (CSV)",
                     data=csv_data,
                     file_name="rnn_classification_results.csv",
-                    mime="text/csv"
+                    mime="text/csv",
                 )
     else:
         st.info("Click 'Train All Models' to start training and comparison.")
 
-# -----------------------------
-# Tab 7
-# -----------------------------
-with tab7:
-    st.header("Interactive Model Search")
-
-    model = get_trained_word2vec()
-    if model is None:
-        st.info("Train Word2Vec from the sidebar first.")
-    else:
-        user_word = st.text_input("Search similar words", "sevgi").strip().lower()
-        topn = st.slider("Top N", 3, 20, 10)
-
-        if user_word:
-            similar = get_similar_words(model, user_word, topn=topn)
-            if similar:
-                sim_user_df = pd.DataFrame(similar, columns=["word", "similarity"])
-                st.dataframe(safe_dataframe(sim_user_df), width="stretch")
-            else:
-                st.error("Word not found in vocabulary.")
 
 st.caption("Built for poetry corpus analysis: statistics, matrices, Word2Vec, GloVe, and interactive similarity search.")
