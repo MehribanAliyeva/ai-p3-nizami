@@ -311,14 +311,13 @@ summary = corpus_summary(
     rare_threshold=rare_threshold,
 )
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "Task 1: Dataset",
     "Matrices",
     "Task 2: Word2Vec",
     "Task 3: GloVe",
     "Task 4: Comparison",
-    "Task 5: RNN Classification",
-    "Interactive Model",
+    "Task 5: RNN Classification"
 ])
 
 # ---------------------------------------------------
